@@ -1,0 +1,165 @@
+name: RDP Extremo Otimizado
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Optimize Windows & RDP Graphics
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+          Write-Host "Aplicando otimizacoes equilibradas..."
+
+          # 1. Plano de energia Alto Desempenho e prioridade de CPU para janela ativa
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 38 -Force
+
+          # 2. Desativar Windows Defender para liberar CPU/RAM
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -DisableBehaviorMonitoring $true
+          Set-MpPreference -DisableIOAVProtection $true
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "DisableAntiSpyware" -Value 1 -Force
+
+          # 3. Parar servicos desnecessarios (mantendo audio e temas ativos)
+          $services = @("SysMain", "WSearch", "Spooler", "wuauserv", "DiagTrack", "MapsBroker", "WerSvc", "TabletInputService")
+          foreach ($svc in $services) {
+              Stop-Service -Name $svc -Force
+              Set-Service -Name $svc -StartupType Disabled
+          }
+
+          # 4. Efeitos visuais leves (sem animacoes pesadas ou transparencia)
+          $visPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+          if (-not (Test-Path $visPath)) { New-Item -Path $visPath -Force | Out-Null }
+          Set-ItemProperty -Path $visPath -Name "VisualFXSetting" -Value 2 -Force
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "DragFullWindows" -Value "0" -Force
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0" -Force
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "EnableTransparency" -Value 0 -Force
+
+          # 5. Configurar RDP com graficos virtualizados ATIVADOS (Corrige travamentos de tela)
+          $rdpTs = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          if (-not (Test-Path $rdpTs)) { New-Item -Path $rdpTs -Force | Out-Null }
+          Set-ItemProperty -Path $rdpTs -Name "fEnableVirtualizedGraphics" -Value 1 -Force
+          Set-ItemProperty -Path $rdpTs -Name "bEnumerateHWBeforeSW" -Value 1 -Force
+          Set-ItemProperty -Path $rdpTs -Name "VisualExperiencePolicy" -Value 0 -Force
+          Set-ItemProperty -Path $rdpTs -Name "ColorDepth" -Value 4 -Force
+
+          # 6. Memoria Virtual equilibrada (4GB fixo para evitar gargalo de disco)
+          $drive = if (Test-Path "D:\") { "D:" } else { "C:" }
+          $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+          if ($cs.AutomaticManagedPagefile) {
+              $cs.AutomaticManagedPagefile = $false
+              $cs | Set-CimInstance
+          }
+          $pf = Get-CimInstance -ClassName Win32_PageFileSetting -Filter "Name='$drive\\pagefile.sys'"
+          if ($pf) { $pf | Remove-CimInstance }
+          New-CimInstance -ClassName Win32_PageFileSetting -Property @{
+              Name = "$drive\pagefile.sys"
+              InitialSize = [uint32]4096
+              MaximumSize = [uint32]4096
+          } | Out-Null
+
+          Write-Host "Otimizacao concluida!"
+
+      - name: Configure RenPy Renderer
+        run: |
+          Write-Host "Configurando suporte grafico do Ren'Py para VM sem GPU..."
+          # Usa renderizacao via software otimizada (evita falhas de 3D em servidores sem placa de video)
+          [System.Environment]::SetEnvironmentVariable("RENPY_RENDERER", "sw", "Machine")
+          Write-Host "Suporte grafico configurado!"
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          New-LocalUser -Name "Skyro" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Skyro"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Skyro"
+          
+          echo "RDP_CREDS=User: Skyro | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "Skyro")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          choco install tailscale -y --no-progress
+          refreshenv
+
+      - name: Establish Tailscale Connection
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) { $tsExe = "tailscale" }
+          
+          & $tsExe up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & $tsExe ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: Skyro"
+          Write-Host "Credentials: $env:RDP_CREDS"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 120
+          }
